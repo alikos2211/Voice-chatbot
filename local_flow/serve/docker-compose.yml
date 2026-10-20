@@ -1,0 +1,28 @@
+services:
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda   # use latest-cpu if no GPU
+    ports:
+      - "8001:8000"          # 8001 because vLLM probably already uses 8000
+    volumes:
+      - hf-cache:/home/ubuntu/.cache/huggingface/hub   # keeps downloaded models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  piper:
+    image: python:3.11-slim
+    container_name: piper-tts
+    working_dir: /voices
+    command: >
+      sh -c "pip install --no-cache-dir 'piper-tts[http]' &&
+             python3 -m piper.download_voices en_US-lessac-medium &&
+             python3 -m piper.http_server -m en_US-lessac-medium --host 0.0.0.0 --port 5000"
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

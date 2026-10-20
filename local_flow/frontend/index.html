@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Chatbot</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1d1f23; --muted: #6b7280;
+    --user: #2563eb; --bot: #eef0f4; --border: #d9dce3; --danger: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --card: #1e2127; --text: #e8eaed; --muted: #9aa1ad;
+      --user: #3b82f6; --bot: #2a2e36; --border: #343943; --danger: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center; min-height: 100vh;
+  }
+  .app {
+    width: 100%; max-width: 720px; display: flex; flex-direction: column;
+    height: 100vh; padding: 16px;
+  }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  #clear {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  #clear:hover { color: var(--danger); border-color: var(--danger); }
+
+  #log {
+    flex: 1; overflow-y: auto; background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .empty { color: var(--muted); text-align: center; margin: auto; font-size: 14px; }
+  .msg { max-width: 80%; padding: 9px 13px; border-radius: 14px; line-height: 1.4;
+         white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.bot  { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+  .msg.error { align-self: center; background: transparent; color: var(--danger); font-size: 13px; }
+
+  #status { height: 22px; font-size: 13px; color: var(--muted); margin: 8px 2px 4px; }
+  #status.recording { color: var(--danger); font-weight: 600; }
+
+  .composer { display: flex; gap: 8px; }
+  #msg {
+    flex: 1; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--card); color: var(--text); font-size: 15px; outline: none;
+  }
+  #msg:focus { border-color: var(--user); }
+  button.action {
+    border: none; border-radius: 10px; padding: 0 16px; font-size: 15px;
+    cursor: pointer; min-height: 44px; color: #fff;
+  }
+  #send { background: var(--user); }
+  #rec  { background: #16a34a; min-width: 108px; }
+  #rec.recording { background: var(--danger); }
+  button.action:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>🎙️ Voice Chatbot</h1>
+    <button id="clear" type="button">Clear history</button>
+  </header>
+
+  <div id="log"><div class="empty" id="empty">Type a message or press 🎤 and speak.</div></div>
+  <div id="status"></div>
+
+  <form class="composer" id="composer" autocomplete="off">
+    <input id="msg" type="text" placeholder="Type a message…">
+    <button class="action" id="send" type="submit">Send</button>
+    <button class="action" id="rec" type="button">🎤 Speak</button>
+  </form>
+</div>
+
+<script>
+// ---------- state ----------
+const sessionId = (crypto.randomUUID && crypto.randomUUID()) ||
+                  String(Date.now()) + Math.random().toString(16).slice(2);
+let recorder = null;
+let chunks = [];
+let busy = false;
+let currentAudio = null;
+
+const logEl    = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const msgEl    = document.getElementById("msg");
+const sendBtn  = document.getElementById("send");
+const recBtn   = document.getElementById("rec");
+const clearBtn = document.getElementById("clear");
+
+// ---------- helpers ----------
+function addMessage(kind, text) {
+  const empty = document.getElementById("empty");
+  if (empty) empty.remove();
+  const div = document.createElement("div");
+  div.className = "msg " + kind;
+  div.textContent = text;              // textContent => safe from HTML injection
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text, recording = false) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("recording", recording);
+}
+
+function setBusy(value) {
+  busy = value;
+  sendBtn.disabled = value;
+  msgEl.disabled = value;
+  // the mic button stays enabled while recording so you can press Stop
+  recBtn.disabled = value;
+}
+
+function playBase64Wav(b64) {
+  if (!b64) return;
+  if (currentAudio) currentAudio.pause();
+  currentAudio = new Audio("data:audio/wav;base64," + b64);
+  currentAudio.play().catch(() => setStatus("Click anywhere on the page to allow audio playback."));
+}
+
+async function readJson(res) {
+  // FastAPI errors look like {"detail": "..."}; handle non-JSON bodies too
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const detail = data && data.detail ? data.detail : res.status + " " + res.statusText;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return data;
+}
+
+// ---------- text chat ----------
+async function sendText(text) {
+  addMessage("user", text);
+  setBusy(true);
+  setStatus("Bot is thinking…");
+  try {
+    const form = new FormData();
+    form.append("session_id", sessionId);
+    form.append("message", text);
+    const res = await fetch("/api/chat", { method: "POST", body: form });
+    const data = await readJson(res);
+    addMessage("bot", data.bot_text);
+    setStatus("");
+  } catch (err) {
+    addMessage("error", "Error: " + err.message);
+    setStatus("");
+  } finally {
+    setBusy(false);
+    msgEl.focus();
+  }
+}
+
+document.getElementById("composer").addEventListener("submit", (e) => {
+  e.preventDefault();                  // stops the page from reloading
+  const text = msgEl.value.trim();
+  if (!text || busy) return;
+  msgEl.value = "";
+  sendText(text);
+});
+
+// ---------- voice chat ----------
+async function startRecording() {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    addMessage("error", "Recording is not supported here. Open the page via http://localhost:8080 in Chrome, Edge or Firefox.");
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    addMessage("error", "Microphone access denied or unavailable: " + err.message);
+    return;
+  }
+
+  if (currentAudio) currentAudio.pause();   // stop the bot talking while you speak
+
+  recorder = new MediaRecorder(stream);
+  chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    sendVoice(new Blob(chunks, { type: recorder.mimeType || "audio/webm" }));
+  };
+  recorder.start();
+  recBtn.textContent = "⏹ Stop";
+  recBtn.classList.add("recording");
+  sendBtn.disabled = true;
+  msgEl.disabled = true;
+  setStatus("● Recording… press Stop when you finish", true);
+}
+
+function stopRecording() {
+  if (recorder && recorder.state === "recording") recorder.stop();
+  recBtn.textContent = "🎤 Speak";
+  recBtn.classList.remove("recording");
+}
+
+async function sendVoice(blob) {
+  if (blob.size === 0) {
+    addMessage("error", "Nothing was recorded.");
+    setBusy(false);
+    setStatus("");
+    return;
+  }
+  setBusy(true);
+  setStatus("Transcribing and thinking…");
+  try {
+    const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
+    const form = new FormData();
+    form.append("session_id", sessionId);
+    form.append("audio", blob, "voice." + ext);
+    const res = await fetch("/api/voice-chat", { method: "POST", body: form });
+    const data = await readJson(res);
+    addMessage("user", data.user_text);
+    addMessage("bot", data.bot_text);
+    playBase64Wav(data.audio_b64);
+    setStatus("");
+  } catch (err) {
+    addMessage("error", "Error: " + err.message);
+    setStatus("");
+  } finally {
+    setBusy(false);
+  }
+}
+
+recBtn.addEventListener("click", () => {
+  if (recorder && recorder.state === "recording") stopRecording();
+  else if (!busy) startRecording();
+});
+
+// ---------- clear ----------
+clearBtn.addEventListener("click", async () => {
+  if (recorder && recorder.state === "recording") {
+    recorder.onstop = () => recorder.stream.getTracks().forEach((t) => t.stop());
+    stopRecording();
+  }
+  if (currentAudio) currentAudio.pause();
+  try {
+    const form = new FormData();
+    form.append("session_id", sessionId);
+    await fetch("/api/clear", { method: "POST", body: form });
+  } catch (_) {}
+  logEl.innerHTML = '<div class="empty" id="empty">History cleared. Type a message or press 🎤 and speak.</div>';
+  setBusy(false);
+  setStatus("");
+});
+</script>
+</body>
+</html>
